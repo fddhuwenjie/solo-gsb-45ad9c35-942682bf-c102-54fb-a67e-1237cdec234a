@@ -208,6 +208,8 @@ CREATE TABLE IF NOT EXISTS transfer_plans (
     reservation_id INTEGER REFERENCES reservations(id),
     -- awaiting_confirmation（已核对待确认）/ committed（已确认并原子执行）
     status         TEXT NOT NULL CHECK (status IN ('awaiting_confirmation', 'committed')),
+    -- 创建计划时的禁配策略修订号；确认时策略修订号已推进即 plan_stale。
+    mix_policy_revision INTEGER NOT NULL DEFAULT 0,
     created_at     TEXT NOT NULL,
     committed_at   TEXT
 );
@@ -262,6 +264,52 @@ CREATE TABLE IF NOT EXISTS plan_confirmations (
     batch_id    INTEGER REFERENCES batches(id),
     confirmed_at TEXT NOT NULL
 );
+
+-- 计划创建时生效的禁配对快照：确认时若策略已被任何 add/remove 修订推进
+-- （即使规则集最终相同），即视为快照失效，确认返回 409 plan_stale（修订号
+-- 本身保存在 transfer_plans.mix_policy_revision）。此表保存快照当时的生效
+-- 禁配对，供 GET 计划重放逐步校验时按「计划时规则」预演（确认执行仍会按
+-- 当时当前规则再次拦截）。
+CREATE TABLE IF NOT EXISTS plan_snapshot_mix_rules (
+    plan_id     INTEGER NOT NULL REFERENCES transfer_plans(id),
+    sample_low  TEXT NOT NULL,
+    sample_high TEXT NOT NULL,
+    PRIMARY KEY (plan_id, sample_low, sample_high)
+);
+
+-- ---------------------------------------------------------------- 样本混合禁配策略
+-- 禁配策略由 add/remove 两类修订构成：每次成功提交追加一条 revision 行，
+-- 其自增 id 即为单调递增的策略修订号；具体增删的样本对记在
+-- mix_policy_revision_pairs。当前生效规则（无序样本对，任意时刻同一对
+-- 只有一条生效行）维护在 mix_policy_active_rules 中，供补液/批次/计划/撤销
+-- 按目标孔当时完整组成拦截。
+CREATE TABLE IF NOT EXISTS mix_policy_revisions (
+    -- 自增主键即单调递增的策略修订号（MAX(id) 为当前修订号，无修订时为 0）；
+    -- 回滚不保留行，下一次成功提交的 id 仍严格大于此前任何修订号。
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_key TEXT NOT NULL UNIQUE,
+    action      TEXT NOT NULL CHECK (action IN ('add', 'remove')),
+    reason      TEXT NOT NULL,
+    created_at  TEXT NOT NULL
+);
+
+-- 每次修订增删的无序样本对（规范化为按名升序的 low/high）。
+CREATE TABLE IF NOT EXISTS mix_policy_revision_pairs (
+    revision_id  INTEGER NOT NULL REFERENCES mix_policy_revisions(id),
+    sample_low   TEXT NOT NULL,
+    sample_high  TEXT NOT NULL,
+    PRIMARY KEY (revision_id, sample_low, sample_high)
+);
+
+-- 当前生效禁配对：主键 (sample_low, sample_high) 保证「同一对只能有一条
+-- 生效规则」；revision_id 记录它由哪次 add 修订启用。
+CREATE TABLE IF NOT EXISTS mix_policy_active_rules (
+    sample_low  TEXT NOT NULL,
+    sample_high TEXT NOT NULL,
+    revision_id INTEGER NOT NULL REFERENCES mix_policy_revisions(id),
+    created_at  TEXT NOT NULL,
+    PRIMARY KEY (sample_low, sample_high)
+);
 """
 
 
@@ -295,7 +343,9 @@ def _migrate(conn: sqlite3.Connection) -> None:
 
     - wells 表补 max_capacity 列：既有行 NULL（不限容量）；
     - batches 表补 reservation_id 列：既有批次均为未绑定预留的普通批次（NULL）；
-    - batches 表补 plan_confirmation_id 列：既有批次均为直接提交（NULL）。
+    - batches 表补 plan_confirmation_id 列：既有批次均为直接提交（NULL）；
+    - transfer_plans 表补 mix_policy_revision 列：既有计划固定为 0（策略首
+      次修订后确认即 plan_stale，须重建计划）。
     现有数据与行为完全保留。
     """
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(wells)")}
@@ -306,6 +356,13 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE batches ADD COLUMN reservation_id INTEGER")
     if "plan_confirmation_id" not in batch_columns:
         conn.execute("ALTER TABLE batches ADD COLUMN plan_confirmation_id INTEGER")
+    plan_columns = {
+        row["name"] for row in conn.execute("PRAGMA table_info(transfer_plans)")
+    }
+    if "mix_policy_revision" not in plan_columns:
+        conn.execute(
+            "ALTER TABLE transfer_plans ADD COLUMN mix_policy_revision INTEGER NOT NULL DEFAULT 0"
+        )
 
 
 @contextmanager
@@ -313,11 +370,12 @@ def write_transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
     """立即写事务：BEGIN IMMEDIATE 在事务起点就取得保留锁。
 
     所有变更端点（补液、批次、撤销、容量变更、隔离申请与解除、预留建立/
-    兑现/取消、计划建立/确认）都经此进入事务，使「校验读 → 写入 →
-    提交」全程互斥串行：后到的事务在 BEGIN IMMEDIATE 处等待，待先到者
-    提交后才开始读库，必然读到已提交的新状态，不会以旧快照覆盖新写入
-    （例如撤销完成阻塞检查后另一请求的补液）。等不到锁由 busy_timeout
-    决定，仍超时则抛 sqlite3.OperationalError 由调用方处理。
+    兑现/取消、计划建立/确认、禁配策略修订）都经此进入事务，使「校验读 →
+    写入 → 提交」全程互斥串行：后到的事务在 BEGIN IMMEDIATE 处等待，待先
+    到者提交后才开始读库，必然读到已提交的新状态，不会以旧快照覆盖新写入
+    （例如撤销完成阻塞检查后另一请求的补液，或规则启用扫描后、提交前到达
+    的补液）。等不到锁由 busy_timeout 决定，仍超时则抛
+    sqlite3.OperationalError 由调用方处理。
     """
     conn.execute("BEGIN IMMEDIATE")
     try:

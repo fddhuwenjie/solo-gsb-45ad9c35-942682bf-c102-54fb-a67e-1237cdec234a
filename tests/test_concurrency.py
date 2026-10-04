@@ -592,3 +592,117 @@ def test_lineage_closure_sees_batch_committed_while_waiting_for_lock(client, mon
     wells = [w["well"] for w in lineage_resp.json()["wells"]]
     # 取锁后读到的最新谱系已含 B1：不会漏掉先提交的边
     assert wells == ["A1", "B1"]
+
+
+
+# -------------------------------- 禁配策略写入与补液串行
+
+
+def test_policy_enable_committed_first_then_topup_is_blocked(client, monkeypatch):
+    """规则启用先持锁提交 -> 排队的补液在锁后读到新规则，409 且液体不变。"""
+    register(client, "A1", "S1", "100")
+    scan_gate = _Gate()
+    topup_past_precheck = threading.Event()
+    original_apply = ledger.apply_mix_policy_change
+
+    def gated_apply(conn, request_key, action, pairs, reason):
+        # 已在 BEGIN IMMEDIATE 之后、存量冲突扫描之前：写锁在手
+        scan_gate.entered.set()
+        assert scan_gate.release.wait(10.0), "策略线程未被释放"
+        return original_apply(conn, request_key, action, pairs, reason)
+
+    monkeypatch.setattr(ledger, "apply_mix_policy_change", gated_apply)
+
+    # 策略先启动并持锁停在扫描前
+    policy_thread, policy_result = _run_in_thread(
+        lambda: client.post(
+            "/mix-policy/revisions",
+            json={"request_key": "mp-conc-1", "action": "add",
+                  "pairs": [{"samples": ["S1", "S2"]}], "reason": "x"},
+        )
+    )
+    scan_gate.wait_inside()
+
+    # 补液在策略锁上排队（此刻规则尚未生效）
+    topup_thread, topup_result = _run_in_thread(
+        lambda: client.post(
+            "/wells", json={"well": "A1", "sample": "S2", "volume": "5"}
+        )
+    )
+    threading.Event().wait(0.3)
+    assert topup_thread.is_alive(), "补液应在策略写事务的锁上排队"
+
+    scan_gate.release.set()
+    policy_resp = _join(policy_thread, policy_result)
+    topup_resp = _join(topup_thread, topup_result)
+
+    # 启用成功（扫描时 A1 只有 S1）
+    assert policy_resp.status_code == 201, policy_resp.text
+    # 补液在锁后按新规则拦截
+    assert topup_resp.status_code == 409
+    assert topup_resp.json()["detail"]["reason"] == "mix_policy_violation"
+    assert client.get("/wells/A1").json()["volume"] == "100"
+
+
+def test_topup_committed_first_then_policy_enable_409(client, monkeypatch):
+    """补液先持锁把 A1 混成 S1+S2 并提交 -> 排队的规则启用在锁后扫描到
+    既有组成冲突，409 且策略不变、request_key 未消耗。"""
+    register(client, "A1", "S1", "100")
+    register_inside = _Gate()
+    original_register = ledger.register_initial_sample
+    original_find = ledger.find_mix_revision_by_key
+
+    def gated_register(conn, well, sample, volume):
+        register_inside.entered.set()
+        assert register_inside.release.wait(10.0), "补液线程未被释放"
+        return original_register(conn, well, sample, volume)
+
+    def gated_find(conn, request_key):
+        # 策略事务外预检先停住，待补液已取锁后再去 BEGIN IMMEDIATE 排队
+        register_inside.wait_inside()
+        return original_find(conn, request_key)
+
+    monkeypatch.setattr(ledger, "register_initial_sample", gated_register)
+    monkeypatch.setattr(ledger, "find_mix_revision_by_key", gated_find)
+
+    def enable():
+        return client.post(
+            "/mix-policy/revisions",
+            json={"request_key": "mp-conc-2", "action": "add",
+                  "pairs": [{"samples": ["S1", "S2"]}], "reason": "x"},
+        )
+
+    policy_thread, policy_result = _run_in_thread(enable)
+    # 补液取锁停在门闩内（此时策略尚未进入写事务）
+    topup_thread, topup_result = _run_in_thread(
+        lambda: client.post(
+            "/wells", json={"well": "A1", "sample": "S2", "volume": "5"}
+        )
+    )
+    register_inside.wait_inside()
+    threading.Event().wait(0.3)
+    assert policy_thread.is_alive(), "策略请求应停在预检门闩前"
+
+    register_inside.release.set()
+    topup_resp = _join(topup_thread, topup_result)
+    policy_resp = _join(policy_thread, policy_result)
+
+    # 补液先提交：A1 变为 105，含 S1+S2
+    assert topup_resp.status_code == 201, topup_resp.text
+    assert topup_resp.json()["volume"] == "105"
+    # 策略在锁后扫描到冲突：409，修订号保持 0，键未消耗
+    assert policy_resp.status_code == 409
+    detail = policy_resp.json()["detail"]
+    assert detail["reason"] == "mix_policy_composition_conflict"
+    assert detail["violating_wells"] == [
+        {"well": "A1", "pair": {"samples": ["S1", "S2"]}, "samples": ["S1", "S2"]}
+    ]
+    assert client.get("/mix-policy").json()["revision"] == 0
+    # 同键修正后（先撤销补液不可行——直接用于新目标场景）仍可提交：
+    # 改成不冲突的规则即可用同一 request_key
+    again = client.post(
+        "/mix-policy/revisions",
+        json={"request_key": "mp-conc-2", "action": "add",
+              "pairs": [{"samples": ["S8", "S9"]}], "reason": "x"},
+    )
+    assert again.status_code == 201, again.text

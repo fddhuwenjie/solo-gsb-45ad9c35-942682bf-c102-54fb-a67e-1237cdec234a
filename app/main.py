@@ -14,6 +14,7 @@ from .schemas import (
     BatchCreate,
     CapacityUpdate,
     LineageQuarantineCreate,
+    MixPolicyChangeCreate,
     PlanConfirmCreate,
     PlanCreate,
     QuarantineCreate,
@@ -77,6 +78,21 @@ def _well_quarantined_detail(exc: ledger.WellQuarantined, **extra) -> dict:
     }
 
 
+def _mix_conflict_detail(exc: ledger.MixConflict, **extra) -> dict:
+    """禁配冲突 409 的统一载荷：孔位、命中样本对、该孔当时全部样本与步骤。"""
+    detail = {
+        "message": str(exc),
+        "reason": "mix_policy_violation",
+        "well": exc.well,
+        "pair": {"samples": list(exc.pair)},
+        "samples": exc.samples,
+        **extra,
+    }
+    if exc.step is not None:
+        detail["failed_step"] = exc.step
+    return detail
+
+
 @app.post("/wells", status_code=201)
 def register_well(payload: WellCreate, conn: sqlite3.Connection = Depends(get_db)) -> dict:
     """登记孔位中的初始样本与体积；同一孔位重复登记视为补液混匀。
@@ -85,12 +101,16 @@ def register_well(payload: WellCreate, conn: sqlite3.Connection = Depends(get_db
     """
     try:
         with db_module.write_transaction(conn):
-            # 立即取写锁：读改写与并发撤销/批次/容量变更串行，补液不会被旧快照覆盖
+            # 立即取写锁：读改写与并发撤销/批次/容量变更/禁配策略修订串行，
+            # 补液不会被旧快照覆盖，拦截也按目标孔当时的完整组成
             ledger.register_initial_sample(conn, payload.well, payload.sample, payload.volume)
     except ledger.WellQuarantined as exc:
         raise HTTPException(status_code=409, detail=_well_quarantined_detail(exc))
     except ledger.CapacityExceeded as exc:
         raise HTTPException(status_code=409, detail=_capacity_exceeded_detail(exc))
+    except ledger.MixConflict as exc:
+        # 禁配：补液整次拒绝，液体不变（补液不消耗 request_key）
+        raise HTTPException(status_code=409, detail=_mix_conflict_detail(exc))
     return ledger.well_state(conn, payload.well)
 
 
@@ -262,6 +282,26 @@ def submit_batch(
             status_code=409,
             detail=_capacity_exceeded_detail(exc, batch_id=batch_id),
         )
+    except ledger.MixConflict as exc:
+        # 禁配与容量超限同为执行中失败：整批回滚，失败批次落库并消耗
+        # request_key；409 返回孔位、样本对与失败步骤
+        try:
+            with db_module.write_transaction(conn):
+                batch_id = ledger.insert_batch(
+                    conn,
+                    payload.request_key,
+                    "failed",
+                    error=str(exc),
+                    reservation_id=payload.reservation_id,
+                )
+        except sqlite3.IntegrityError:
+            row = ledger.find_batch_by_key(conn, payload.request_key)
+            response.status_code = 200
+            return ledger.batch_payload(conn, row["id"], replayed=True)
+        raise HTTPException(
+            status_code=409,
+            detail=_mix_conflict_detail(exc, batch_id=batch_id),
+        )
     except sqlite3.IntegrityError:
         # 并发下同一 request_key 已被写入：按重放处理，不重复执行
         row = ledger.find_batch_by_key(conn, payload.request_key)
@@ -336,12 +376,19 @@ def _plan_replay_or_conflict(
 
 def _plan_stale_detail(exc: ledger.PlanStale, **extra) -> dict:
     """快照失效 409：逐孔列出变化维度与原因，计划保持可重试。"""
-    return {
+    detail = {
         "message": str(exc),
         "reason": "plan_stale",
         "changed_wells": exc.changed_wells,
         **extra,
     }
+    if exc.policy_revision_at_plan is not None:
+        detail["mix_policy_revision_at_plan"] = exc.policy_revision_at_plan
+        detail["mix_policy_revision_now"] = exc.policy_revision_now
+        if exc.policy_revision_now != exc.policy_revision_at_plan:
+            detail.setdefault("changed_wells", [])
+            detail["mix_policy_changed"] = True
+    return detail
 
 
 @app.post("/plans", status_code=201)
@@ -369,10 +416,11 @@ def create_plan(
             row = ledger.find_plan_by_key(conn, payload.request_key)
             if row is not None:
                 return _plan_replay_or_conflict(conn, row, payload, response)
-            snapshot, steps, _own = ledger.preview_plan(
+            snapshot, steps, _own, mix_revision, _mix_rule_ids = ledger.preview_plan(
                 conn, payload.operations, payload.reservation_id
             )
-        # 写事务落库：重读涉及孔，只读快照之后若已有任何变更即 409（不落计划）。
+        # 写事务落库：重读涉及孔，只读快照之后若已有任何变更或禁配策略修订
+        # 已推进即 409（不落计划）。
         with db_module.write_transaction(conn):
             row = ledger.find_plan_by_key(conn, payload.request_key)
             if row is not None:
@@ -383,6 +431,7 @@ def create_plan(
                 payload.operations,
                 payload.reservation_id,
                 snapshot,
+                mix_revision,
             )
     except ledger.WellQuarantined as exc:
         # 隔离冲突：不落计划、不消耗 request_key，解除隔离后同键可重试
@@ -587,6 +636,13 @@ def confirm_plan(
             status_code=409,
             detail=_capacity_exceeded_detail(exc, plan_id=plan_id),
         )
+    except ledger.MixConflict as exc:
+        # 锁内执行时命中禁配（通常已被 plan_stale 拦截；防御性兜底）：
+        # 同事务回滚，未写批次/确认，confirm_key 不消耗，可核对后重试
+        raise HTTPException(
+            status_code=409,
+            detail=_mix_conflict_detail(exc, plan_id=plan_id),
+        )
     except sqlite3.IntegrityError:
         # 兜底：极端并发下 confirm_key 唯一约束拦截
         row = ledger.find_confirmation_by_key(conn, payload.confirm_key)
@@ -684,6 +740,8 @@ def reverse_batch(
             detail["blocking_wells"] = exc.blockers
         if exc.exceeding:
             detail["exceeding_wells"] = exc.exceeding
+        if exc.violating:
+            detail["violating_wells"] = exc.violating
         raise HTTPException(status_code=409, detail=detail)
     except sqlite3.IntegrityError:
         # 兜底：极端并发下 request_key 唯一约束拦截（正常已被锁内复核覆盖）
@@ -1246,3 +1304,124 @@ def cancel_reservation(
 
     response.status_code = 201
     return ledger.cancellation_payload(conn, cancellation_id)
+
+
+# ---------------------------------------------------------------- 样本混合禁配策略
+
+
+def _mix_policy_replay_or_conflict(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+    payload: MixPolicyChangeCreate,
+    response: Response,
+) -> dict:
+    """同键同目标（动作 + 排序去重后的样本对集合）重放；同键换目标 409。
+
+    原因（reason）不参与目标身份：同键同动作同样本对即视为重放，返回首次
+    修订结果；换动作或换任一样本对返回 409 request_key_conflict。
+    """
+    existing_action, existing_pairs = ledger.mix_revision_target(conn, int(row["id"]))
+    submitted_pairs = payload.normalized_pairs
+    if existing_action == payload.action and existing_pairs == submitted_pairs:
+        response.status_code = 200
+        return ledger.mix_policy_payload(
+            conn, replayed=True, applied_revision_id=int(row["id"])
+        )
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "message": (
+                f"request_key {payload.request_key} 已用于一次 "
+                f"{existing_action} 修订（样本对 "
+                f"{', '.join(f'{a}/{b}' for a, b in existing_pairs)}），"
+                f"不能再提交不同目标"
+            ),
+            "reason": "request_key_conflict",
+            "existing_revision_id": int(row["id"]),
+            "existing_action": existing_action,
+            "existing_pairs": [{"samples": list(pair)} for pair in existing_pairs],
+        },
+    )
+
+
+@app.get("/mix-policy")
+def get_mix_policy(conn: sqlite3.Connection = Depends(get_db)) -> dict:
+    """查询当前禁配策略：生效规则集合（含各自启用修订号）与当前修订号。
+
+    尚无任何成功修订时 revision 为 0、rules 为空。
+    """
+    return ledger.mix_policy_payload(conn)
+
+
+@app.get("/mix-policy/revisions")
+def list_mix_policy_revisions(conn: sqlite3.Connection = Depends(get_db)) -> dict:
+    """全部禁配策略修订审计（成功提交的 add/remove 记录）。"""
+    return {"revisions": ledger.list_mix_policy_revisions(conn)}
+
+
+@app.post("/mix-policy/revisions", status_code=201)
+def submit_mix_policy_change(
+    payload: MixPolicyChangeCreate,
+    response: Response,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> dict:
+    """提交一次禁配策略修订（add 启用 / remove 撤销 1～64 个无序样本对）。
+
+    同一对样本只能有一条生效规则：add 已生效对、remove 未生效对均 409，
+    不产生修订、不消耗 request_key。add 时先扫描所有已登记孔，已有组成同时
+    含某新禁配对两个样本即 409 mix_policy_composition_conflict（逐孔列出孔位、
+    样本对与该孔完整组成），策略不变。成功后修订号 +1，返回当前规则与修订号。
+
+    策略写入与补液、批次、计划确认、撤销、容量、隔离、预留等所有变更端点
+    在同一把写锁上串行。request_key 幂等：同键同动作同样本对集合重放首次
+    结果（200 replayed=true，返回首次修订后的当前状态）；同键换动作或换
+    样本对返回 409 request_key_conflict。
+    """
+    # 事务外快速路径：无并发时直接给出重放/换目标结论，免取写锁。
+    existing = ledger.find_mix_revision_by_key(conn, payload.request_key)
+    if existing is not None:
+        return _mix_policy_replay_or_conflict(conn, existing, payload, response)
+
+    try:
+        # BEGIN IMMEDIATE 立即取锁：存量冲突扫描与规则增删持同一把锁完成，
+        # 与并发补液/批次/计划确认/撤销串行，拦截必然基于已提交的最新组成。
+        with db_module.write_transaction(conn):
+            row = ledger.find_mix_revision_by_key(conn, payload.request_key)
+            if row is not None:
+                return _mix_policy_replay_or_conflict(conn, row, payload, response)
+            revision_id = ledger.apply_mix_policy_change(
+                conn,
+                payload.request_key,
+                payload.action,
+                payload.normalized_pairs,
+                payload.reason,
+            )
+    except ledger.MixPolicyConflict as exc:
+        # add 已生效对 / remove 未生效对：整次拒绝，不产生修订、不消耗键
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": str(exc),
+                "reason": exc.reason,
+                "pairs": exc.pairs,
+            },
+        )
+    except ledger.MixPolicyCompositionConflict as exc:
+        # 启用规则与既有已登记孔组成冲突：逐孔列出，策略不变、不消耗键
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": str(exc),
+                "reason": "mix_policy_composition_conflict",
+                "violating_wells": exc.violating_wells,
+            },
+        )
+    except sqlite3.IntegrityError:
+        # 兜底：极端并发下 request_key 唯一约束拦截（正常已被锁内复核覆盖）
+        row = ledger.find_mix_revision_by_key(conn, payload.request_key)
+        if row is not None:
+            return _mix_policy_replay_or_conflict(conn, row, payload, response)
+        raise
+
+    response.status_code = 201
+    return ledger.mix_policy_payload(conn, applied_revision_id=revision_id)

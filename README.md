@@ -11,6 +11,7 @@
 - **按移液谱系扩展隔离**：操作员只需提交一个或多个**种子孔**、案件号、原因与 `request_key`，服务在同一写事务内沿**已提交且未撤销**批次的 source→destination 边计算传递闭包，把种子及所有后代孔作为一次隔离申请——环路上的孔只计一次，响应按孔返回从种子出发**边数最短、长度相同时按节点序列字典序稳定**的移液路径（种子孔距离为 0）。闭包内任一孔未登记、已隔离或存在生效预留即整次拒绝、不写部分状态、不消耗键；成功后该申请就是一条普通隔离申请，后续移液、补液、容量变更、预留、计划确认与撤销均沿用同一套隔离限制，解除仍走 `/quarantines/releases`。同键同种子同案件重放（返回首次算出的孔集与路径，谱系图事后增长不重新扩展），同键换种子/换案件、或同键在普通隔离与谱系隔离之间互用返回 `409`；撤销一批已提交移液会使其边立即退出谱系传播范围；
 - **移液体积预留**：操作员用 `request_key` 为未来批次一次预留多个已登记来源孔的 `Decimal` 体积；服务在同一事务扣除各孔其他生效预留后检查可用量，任一孔可用不足、孔已隔离或未登记即整次失败、不留部分预留；同键同目标（逐孔体积集合）重放、同键换目标 `409`。普通补液和未绑定预留的批次不能动用被预留体积（来源孔可吸取量 = 当前体积 − 生效预留量）；提交批次可携带 `reservation_id`，只有逐孔逐量完全兑现（预留的每个来源孔吸取量之和严格等于预留体积）才在同一事务执行移液并把预留标记为 `consumed`，任何失败（兑现不符、体积不足、容量超限）都整批回滚、不消耗预留。未消费预留可用独立 `request_key` 整体取消（`cancelled`），已消费预留不可取消；取消/兑现/建立与隔离申请在同一把写锁上串行。查询返回预留明细与状态；
 - 所有体积运算使用 `Decimal`（统一量化到小数点后 9 位），不使用 float；预留体积同样以 TEXT 存 Decimal 字符串、按 Decimal 比较；
+- **样本混合禁配策略**：操作员用 `request_key` 提交 `add`/`remove` 动作与 1～64 个**无序样本对**（及原因）修订策略；同一对样本任意时刻只有一条生效规则（重复启用/撤销不存在的规则返回 409，不产生修订、不消耗键），查询返回当前生效规则与单调递增的修订号（无修订时为 0）。`add` 在同一写事务先扫描**所有已登记孔**的当时完整组成，任一孔已同时含某新禁配对即返回 `409 mix_policy_composition_conflict`（逐孔列出孔位、样本对与完整组成），策略不变、不消耗键。此后**补液、批次的每一步与计划确认**都按目标孔**当时的完整组成**拦截禁配：补液整次拒绝；批次任一步形成禁配即整批回滚并在 409 返回孔位、样本对与失败步骤（失败批次落库并消耗键，与容量超限一致）；计划预演在失败步返回逐步校验结果（不落计划、不消耗键）。**计划快照包含策略修订号**：确认时任何成功的 add/remove 都使确认返回 `409 plan_stale`（即使规则集恰好回到原状），计划保持可重试；计划同时保存创建时生效规则集，GET 逐步校验按计划时规则重放。**撤销批次前**同样核对恢复快照后的各孔完整组成不违反**当前**规则（`409 mix_policy_violation`，逐孔列出）。策略写入与补液、批次、撤销、计划确认、容量、隔离、预留等所有变更端点在同一把 `BEGIN IMMEDIATE` 写锁上串行；`request_key` 同动作同样本对集合重放首次结果（原因不参与目标比对），换动作/换样本对返回 `409`；
 - **移液计划（先核对、后确认）**：一次移液可以先以 `request_key` 提交 operations（可选 `reservation_id`）创建计划：服务在**只读事务**固定涉及孔当前体积、组成、容量、隔离与生效预留的规范快照，返回逐步校验结果，但**不写批次、不改变液体**；随后用独立 `confirm_key` 确认，服务在同一写事务重读状态，仅当快照中涉及孔、容量、隔离及预留状态均未变化时才按原顺序原子执行并把计划标记 `committed`。任一变化返回 `409 plan_stale` 并逐孔列出变化原因，计划保持待确认、可重试；确认重放、错键冲突与已确认计划均不会重复扣量；预演失败不落计划；
 - 通过 `request_key` 幂等去重：相同键重复提交不会重复执行，直接返回首个结果（失败批次同样被记录并消耗该键）；批次撤销同样以 `request_key` 幂等：同键同目标返回首次结果，同键换目标返回 `409`。
 
@@ -63,6 +64,9 @@ pytest                                       # 运行测试
 | `POST` | `/quarantines/lineage` | 按移液谱系扩展隔离：种子孔 + 案件号 + 原因，沿已提交未撤销批次的边求传递闭包并按孔返回最短且字典序稳定的路径（`request_key` 幂等） |
 | `POST` | `/quarantines/releases` | 解除隔离：须携带对应 `case_id`，批量解除任一不匹配整体拒绝（`request_key` 幂等） |
 | `GET` | `/quarantines` / `/quarantines/releases` | 全部隔离申请（含各孔状态）/ 解除审计记录 |
+| `GET` | `/mix-policy` | 当前禁配策略：生效规则（含各自启用修订号）与当前修订号 |
+| `POST` | `/mix-policy/revisions` | 提交 add/remove 修订（1～64 个无序样本对 + 原因；`request_key` 幂等） |
+| `GET` | `/mix-policy/revisions` | 全部禁配策略修订审计记录 |
 
 孔位标签为「字母 + 数字」（如 `A1`、`B12`），不区分大小写；本服务按单块板建模。
 
@@ -505,6 +509,82 @@ curl -s http://localhost:8000/plans            # 全部计划（待确认/已提
 建立——任何已提交变更都会让相关计划在确认时得到 `plan_stale`，由调用方核对
 后决定重试还是放弃。
 
+### 样本混合禁配策略
+
+```bash
+# 42. 查看当前策略：尚无任何成功修订时 revision=0、rules=[]
+curl -s http://localhost:8000/mix-policy
+# => {"revision":0,"rules":[],"replayed":false}
+
+# 43. 启用禁配：S1 与 S2 不得同孔（1～64 个无序样本对，顺序互换等价，
+#     请求内重复对静默去重）；修订号 +1，返回当前规则与本次修订摘要
+curl -s -X POST http://localhost:8000/mix-policy/revisions \
+  -H 'Content-Type: application/json' \
+  -d '{"request_key":"mix-2026-10-04-001","action":"add",
+       "pairs":[{"samples":["S2","S1"]}],"reason":"两种试剂互溶失活"}'
+# => 201 {"revision":1,"rules":[{"samples":["S1","S2"],"added_revision":1}],
+#         "applied":{"revision_id":1,"action":"add","reason":"...",
+#                    "pairs":[{"samples":["S1","S2"]}]},...}
+
+# 44. 启用时已有孔同时含这对样本 -> 409 mix_policy_composition_conflict，
+#     逐孔列出孔位/样本对/该孔完整样本，策略不变、键未消耗，排除后同键重试
+# => 409 {"detail":{"reason":"mix_policy_composition_conflict","violating_wells":[
+#         {"well":"B1","pair":{"samples":["S1","S2"]},"samples":["S1","S2"]}]}}
+
+# 45. 启用后的拦截：补液命中 -> 409 mix_policy_violation，液体不变
+curl -s -X POST http://localhost:8000/wells -H 'Content-Type: application/json' \
+  -d '{"well":"A1","sample":"S2","volume":"5"}'
+# => 409 {"detail":{"reason":"mix_policy_violation","well":"A1",
+#                   "pair":{"samples":["S1","S2"]},"samples":["S1","S2"]}}
+
+# 46. 批次按目标孔每一步的当时完整组成拦截；第 2 步形成 S1+S2 -> 整批回滚，
+#     返回孔位、样本对与失败步骤（失败批次落库并消耗 request_key）
+curl -s -X POST http://localhost:8000/batches -H 'Content-Type: application/json' \
+  -d '{"request_key":"b-mix","operations":[
+        {"source":"A1","destination":"B1","volume":"10"},
+        {"source":"A2","destination":"B1","volume":"10"}]}'
+# => 409 {"detail":{"reason":"mix_policy_violation","well":"B1","failed_step":2,
+#                   "pair":{"samples":["S1","S2"]},"samples":["S1","S2"],
+#                   "batch_id":...}}
+
+# 47. 重复 add 已生效对 / remove 未生效对 -> 409，不产生修订、不消耗键
+#     mix_rule_exists / mix_rule_not_found（pairs 逐对列出）
+
+# 48. 撤销禁配：只影响之后的新操作；成功后修订号再 +1
+curl -s -X POST http://localhost:8000/mix-policy/revisions \
+  -H 'Content-Type: application/json' \
+  -d '{"request_key":"mix-2026-10-04-002","action":"remove",
+       "pairs":[{"samples":["S1","S2"]}],"reason":"复检确认可混用"}'
+
+# 49. request_key 幂等：同键同动作同样本对集合重放首次结果（200 replayed=true，
+#     原因不同也算重放）；同键换动作或换样本对 -> 409 request_key_conflict。
+#     GET /mix-policy/revisions 查看全部修订审计。
+```
+
+计划与禁配策略：
+
+```bash
+# 50. 创建计划时快照包含策略修订号与当时生效规则集（GET /plans/{id} 返回
+#     mix_policy_revision 与 mix_rules；逐步校验按计划时规则重放）
+curl -s -X POST http://localhost:8000/plans -H 'Content-Type: application/json' \
+  -d '{"request_key":"plan-mix-1","operations":[
+        {"source":"A1","destination":"D1","volume":"10"}]}'
+# => 201 {"mix_policy_revision":1,"mix_rules":[{"samples":["S1","S2"]}],...}
+
+# 51. 预演某一步会形成禁配 -> 409 mix_policy_violation，响应带 failed_step、
+#     孔位、样本对与逐步校验结果；不落计划、不消耗 request_key
+
+# 52. 计划待确认期间策略发生任何成功修订（含撤销后原样重新启用）->
+#     确认返回 409 plan_stale（mix_policy_changed=true，附计划时/当前修订号），
+#     计划保持 awaiting_confirmation、confirm_key 未消耗，可按新策略重建计划
+# => 409 {"detail":{"reason":"plan_stale","mix_policy_changed":true,
+#                   "mix_policy_revision_at_plan":1,"mix_policy_revision_now":3,...}}
+
+# 53. 撤销批次前同样核对恢复快照不违反当前规则：
+#     恢复后某孔完整组成命中禁配对 -> 409 mix_policy_violation，
+#     violating_wells 逐孔列出孔位/样本对/完整组成，液体与审计不变
+```
+
 ## 设计要点
 
 - **Decimal 精度**：体积与组分量在库中以 TEXT 存 Decimal 字符串，运算全部走 `decimal.Decimal`，结果统一量化到 9 位小数（`ROUND_HALF_UP`），接口返回值中的数字均为字符串以避免 JSON 精度损失。
@@ -523,14 +603,15 @@ curl -s http://localhost:8000/plans            # 全部计划（待确认/已提
 - **按移液谱系扩展隔离**：谱系申请复用 `quarantine_requests` / `quarantine_wells` 主表（一条申请号即一条隔离，`released_at IS NULL` 的部分唯一索引、孔位查询与**所有下游限制全部原样沿用**，无需任何特例分支），另用 `quarantine_lineage_seeds`（每种子一行）与 `quarantine_lineage_wells`（闭包每孔一行：距离 + JSON 路径）保存种子与首次算出的闭包，供同键重放与按孔返回路径。传播图取 `operations JOIN batches LEFT JOIN reversals` 中 `status='committed'` 且无撤销记录的边：失败批次从未移液不产生边，撤销已把液体恢复到批前快照，其边立即退出传播范围。闭包在**写事务持锁后**用 `(边数, 路径元组)` 最小堆扩张：先按最短边数到达，同长度时按整条路径的节点序列字典序取最小（与批次提交顺序、边插入顺序无关，完全确定）；回到当前路径上的孔只成环、不重复入堆，故环路只计一次，不会无限循环。多个种子取闭包并集，每孔路径从使 `(距离, 路径)` 最小的种子出发。闭包内所有孔执行与普通隔离**完全相同**的原子校验（未登记 `404` / 已隔离 `409 already_quarantined` / 存在生效预留 `409 reservations_active`），任一不通过整事务回滚、不留部分状态、不消耗 `request_key`。幂等目标身份是「案件 + 排序去重后的种子孔集合」：闭包是提交时谱系图的派生快照，重放不重新计算（谱系图事后增长、相关批次撤销都不改变首次结果），同键换种子/换案件返回 `409`；普通隔离与谱系隔离的键各自独立、互不通用（同键跨类型返回 `409 request_key_conflict`，载荷以 `existing_kind` 标明既有类型）。解除不区分申请类型，仍走 `/quarantines/releases`（案件号 + 孔位逐孔匹配）。
 - **移液体积预留**：`reservations`（`status` 为 `active` / `consumed` / `cancelled`，建立 `request_key` 唯一）+ `reservation_items`（每孔一行 Decimal 体积字符串）+ `reservation_cancellations`（取消审计，独立 `request_key` 唯一），`batches.reservation_id` 记录兑现批次（老库经 `ALTER TABLE` 就地补列，历史批次一律 `NULL`）。建立预留时在同一写事务内先确认所有孔已登记、未隔离，再按「孔当前体积 − 其他 active 预留量之和」逐孔校验可预留量：任一不足（`409 reservation_unavailable`，`conflicting_wells` 逐孔列出可用量/已预留量/请求量）即整体回滚，不留部分预留、不消耗 `request_key`。生效预留只约束**可吸取量下限**：未绑定预留的批次从来源孔吸液时可用量按 `当前体积 − 全部 active 预留量` 计，不足即 `InsufficientVolume`；补液是加入液体，不受预留阻塞，补液后可用量相应增加。批次携带 `reservation_id` 时，预留必须存在（`404 reservation_not_found`）且为 `active`（`409 reservation_not_active`），且批次从每个预留来源孔吸取的体积之和与预留体积**逐孔严格相等**——预留的每个孔都必须作为来源出现，批次也不得对未预留的来源孔吸液，否则 `409 reservation_fulfillment_mismatch`（`mismatched_wells` 逐孔列出 `reserved` 与 `requested`，未出现的一列为 `null`），该检查先于任何写入，故整批不留痕迹、不落失败批次、不消耗 `request_key`、预留保持 `active`；兑现匹配时本批次有权动用该预留自身的体积，但仍不得动用同孔其他 active 预留的体积（执行中体积不足/容量超限仍按普通失败处理：失败批次落库并消耗批次键，随事务回滚的 `consumed` 标记不会生效）。只有逐孔逐量完全兑现并成功提交时，才在同一事务把预留置为 `consumed`（记 `consumed_batch_id`/`consumed_at`），保证兑现与消费原子。取消用**独立** `request_key`（`POST /reservations/{id}/cancellations`）：仅 `active` 可取消（`consumed` → `409 already_consumed`；`cancelled` → `409 already_cancelled`），取消审计与预留状态同事务更新；取消键同键同预留重放返回首次结果，同键换预留返回 `409 request_key_conflict`。撤销批次在恢复快照前同样核对恢复后体积不低于各孔 active 预留量（批次新建、撤销即删除的孔上若有生效预留会以 `409 reservations_active` 阻塞并逐孔列出恢复后体积/预留量），预留一旦 `consumed` 不因批次撤销而退回 `active`（无「退回预留」语义，避免复活已归属的体积）。`GET /wells/{well}` 返回 `reserved_volume`（active 预留总量）、`available_volume`（当前体积 − active 预留量）与逐预留明细；`GET /reservations[/{id}]` 返回明细与状态（含消费批次与取消审计）。
 - **移液计划（先核对、后确认）**：`transfer_plans`（`status` 为 `awaiting_confirmation` / `committed`，建立 `request_key` 唯一）+ `plan_operations`（按原顺序保存逐步操作）+ `plan_well_snapshots` / `plan_snapshot_composition` / `plan_snapshot_reservations`（创建时固定的涉及孔规范快照：孔是否登记、体积、各样本量、容量上限、隔离申请 id、生效预留「编号→体积」集合）+ `plan_confirmations`（确认审计，`plan_id` 与 `confirm_key` 各一唯一约束）。`POST /plans` 先在**只读快照事务**（`BEGIN` 后整段读取同一一致性快照，不取写锁、WAL 下不阻塞并发写）完成与直接批次完全一致的前置校验（隔离、预留存在/生效/逐孔逐量兑现）并在内存中按与 `apply_transfer` 同一套规则（最大余量法、逐步容量、可用量扣除他人预留）逐步预演，返回逐步校验结果；随后进入写事务**重读涉及孔再核一次**——只读快照之后、取锁之前若已有提交即 `409 plan_stale`（不落计划、不消耗 `request_key`）。预演失败（体积不足/容量超限/隔离/预留不合法）一律不落计划、不留批次、不消耗键。`POST /plans/{id}/confirmations` 在 `BEGIN IMMEDIATE` 写事务内：先复核 `confirm_key`（同键同计划重放首次确认，HTTP 200 `replayed=true`；同键换计划 `409 request_key_conflict`），再要求计划处于 `awaiting_confirmation`（重复确认 `409 already_committed`），然后重读涉及孔逐维对比快照——孔登记状态、体积、组成（逐样本量）、容量、隔离申请、生效预留集合任一不同即 `409 plan_stale`，`changed_wells` 逐孔列出 `volume_changed` / `composition_changed` / `capacity_changed` / `quarantined` / `quarantine_released` / `quarantine_changed` / `reservations_changed`（预留级 `reserved` / `reservation_released` / `reservation_volume_changed`）/ `well_registered` / `well_removed` 及前后值，计划保持待确认、`confirm_key` 未消耗，冲突源消失后可原键重试；核对通过后插入确认记录，并以 `confirm_key` 作为批次 `request_key` 调用与直接提交共用的批次执行路径（按原顺序原子移液、保存批前快照、记事件、绑定预留同事务 `consumed`），再置计划 `committed`——执行与确认审计同事务，任一异常整体回滚、不扣量；批次表唯一约束与确认表唯一约束双重兜底，确认重放/错键/已确认计划在任何并发交错下都不会执行第二次。确认产生的批次经 `batches.plan_confirmation_id` 溯源，是普通批次（可撤销、进孔位批次史）；计划待确认期间不持有体积或孔锁，不阻塞任何其他端点，只在确认时以快照一致性把关。老库经 `ALTER TABLE` 就地补列，历史批次该列为 `NULL`，直接提交语义完全保留。
-- **状态码**：登记/批次成功/撤销成功/隔离申请/解除隔离/预留建立/预留取消/计划创建/计划确认成功 `201`；容量设置/取消成功 `200`；幂等重放（含计划/确认重放）`200`；体积不足、容量超限、撤销冲突、隔离冲突、预留冲突（可用不足/换目标/预留未生效/未完全兑现/已消费或重复取消）、计划快照失效/错键/重复确认 `409`；孔位/批次/预留/计划不存在 `404`；参数非法 `422`。
+- **状态码**：登记/批次成功/撤销成功/隔离申请/解除隔离/预留建立/预留取消/计划创建/计划确认成功/禁配策略修订成功 `201`；容量设置/取消成功 `200`；幂等重放（含计划/确认重放）`200`；体积不足、容量超限、撤销冲突、隔离冲突、预留冲突（可用不足/换目标/预留未生效/未完全兑现/已消费或重复取消）、禁配冲突（补液/批次/计划预演/撤销恢复违规）、禁配修订冲突（重复启用/撤销不存在/启用时存量组成冲突/换目标）、计划快照失效/错键/重复确认 `409`；孔位/批次/预留/计划不存在 `404`；参数非法 `422`。
+- **样本混合禁配策略**：`mix_policy_revisions`（每次成功 add/remove 追加一条，自增主键 `id` 即单调修订号——`MAX(id)` 为当前修订号，校验失败在插入前抛出因而修订号连续无空洞）+ `mix_policy_revision_pairs`（本次增删的无序对，规范化为按名升序的 low/high）+ `mix_policy_active_rules`（当前生效对，主键 `(sample_low, sample_high)` 保证同一对只有一条生效行，行内记录启用修订号）。规则以**样本名 TEXT**直接存储与比对，无需为策略建立样本外键：引用尚未登记样本名的规则在任何真实组成中都不可能命中。启用在写事务持锁后先做两类前置校验——`add` 的对不得与现有生效对相交（`409 mix_rule_exists`），且扫描全部已登记孔（`well_composition JOIN samples`）的组成样本集合，任一孔同时含某新对两个样本即 `409 mix_policy_composition_conflict`（逐孔列出）；`remove` 的对必须全部在生效集合中（`409 mix_rule_not_found`）。两类失败都在写入修订行之前抛出，整事务回滚、不留部分状态、不消耗 `request_key`。运行时拦截统一走「目标孔操作后的完整样本名集合 ∩ 生效对」：补液在容量校验后、写入前按「既有样本 ∪ 本次样本」检查；批次在每步容量校验后、卷数落库前读取目标孔已写入的移入后组成检查（整批随事务回滚，失败批次与容量/体积失败一样落 `failed` 并消耗键，409 载荷含 `failed_step`）；计划预演在内存快照上按同一顺序检查（失败不落计划、不消耗键）；撤销在容量与预留检查之后、真正恢复之前，按批前快照组成对**当前**生效规则检查。策略修订号存入 `transfer_plans.mix_policy_revision`（老库迁移补列、历史计划为 0），创建时生效规则集另存 `plan_snapshot_mix_rules`（供 GET 逐步校验按计划时规则重放）；确认时除孔维快照外还要求修订号严格相等——**任何**成功修订都令确认 `plan_stale`，即使规则集最终与计划时相同。策略端点与其他所有变更端点共用 `BEGIN IMMEDIATE`：先提交的规则修订必然被后取锁的补液/批次/确认/撤销看到，反之规则启用扫描也必然读到先提交的液体状态。策略 `request_key` 为独立命名空间，目标身份是「动作 + 排序去重后的样本对集合」（原因不参与），同键重放返回首次修订后重新装配的当前状态，换目标 `409`。
 
 ## 项目结构
 
 ```
 app/
   main.py     # FastAPI 路由
-  ledger.py   # 谱系台账核心逻辑（Decimal 运算、事务内批量执行、计划快照/预演/确认）
+  ledger.py   # 谱系台账核心逻辑（Decimal 运算、事务内批量执行、计划快照/预演/确认、禁配策略与拦截）
   db.py       # SQLite 连接、只读/写事务与建表
   schemas.py  # 请求体验证
 tests/        # pytest 端到端测试

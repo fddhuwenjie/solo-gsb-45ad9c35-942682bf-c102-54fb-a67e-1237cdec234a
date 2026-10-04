@@ -273,3 +273,60 @@ class ReservationCancelCreate(BaseModel):
         if not value:
             raise ValueError("request_key 不能为空")
         return value
+
+
+# ---------------------------------------------------------------- 样本混合禁配策略
+
+
+class SamplePair(BaseModel):
+    """一对无序样本：提交顺序不敏感，(S1, S2) 与 (S2, S1) 视为同一对。"""
+
+    samples: list[str] = Field(min_length=2, max_length=2)
+
+    @field_validator("samples")
+    @classmethod
+    def _samples(cls, value: list[str]) -> list[str]:
+        names = []
+        for raw in value:
+            name = raw.strip()
+            if not name:
+                raise ValueError("样本名不能为空")
+            if len(name) > 128:
+                raise ValueError("样本名最长 128 个字符")
+            names.append(name)
+        if names[0] == names[1]:
+            raise ValueError("禁配样本对必须是两个不同的样本")
+        # 无序对规范化：按名升序，调用方以何种顺序提交都得到同一目标。
+        return sorted(names)
+
+
+class MixPolicyChangeCreate(BaseModel):
+    """样本混合禁配策略修订：add 启用 / remove 撤销 1～64 个无序样本对。
+
+    提交内重复对（含顺序互换）静默去重；request_key 幂等：同键同动作同
+    样本对集合重放返回首次结果（200），同键换动作或换样本对返回 409。
+    """
+
+    request_key: str = Field(min_length=1, max_length=128)
+    action: str = Field(pattern=r"^(add|remove)$")
+    pairs: list[SamplePair] = Field(min_length=1, max_length=64)
+    reason: str = Field(min_length=1, max_length=500)
+
+    @field_validator("request_key", "reason")
+    @classmethod
+    def _text(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("字段不能为空")
+        return value
+
+    @model_validator(mode="after")
+    def _dedupe_pairs(self) -> "MixPolicyChangeCreate":
+        # pairs 已逐对规范化为升序；按 (low, high) 去重并排序，得到目标统一形式。
+        unique = sorted({tuple(pair.samples) for pair in self.pairs})
+        self.pairs = [SamplePair(samples=list(pair)) for pair in unique]
+        return self
+
+    @property
+    def normalized_pairs(self) -> list[tuple[str, str]]:
+        return [(pair.samples[0], pair.samples[1]) for pair in self.pairs]
