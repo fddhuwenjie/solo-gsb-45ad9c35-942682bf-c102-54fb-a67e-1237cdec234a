@@ -74,6 +74,33 @@ class WellQuarantined(Exception):
         super().__init__(f"孔位 {labels} 处于隔离状态，禁止该操作")
 
 
+class MixingConflict(Exception):
+    """目标孔的完整组成命中生效中的样本混合禁配规则。
+
+    补液、批次任一步（按目标孔当时的完整组成）或撤销快照恢复后命中即抛出：
+    补液整体拒绝；批次整批回滚（失败批次仍落库并消耗 request_key）；
+    撤销拒绝且液体不变。pair 为排序后的样本名二元组，step 为批次步骤序号
+    （补液/撤销场景为 None）。
+    """
+
+    def __init__(
+        self,
+        well: str,
+        pair: tuple[str, str],
+        *,
+        step: int | None = None,
+        rule_id: int | None = None,
+    ) -> None:
+        self.well = well
+        self.pair = [pair[0], pair[1]]
+        self.step = step
+        self.rule_id = rule_id
+        context = f"第 {step} 步后" if step is not None else ""
+        super().__init__(
+            f"孔位 {well}{context}的完整组成包含禁配样本对 {pair[0]}、{pair[1]}，操作被拒绝"
+        )
+
+
 def q(value: Decimal) -> Decimal:
     """量化到统一精度。quantize 单调不减，组分量不会被放大到超过原值。"""
     return value.quantize(QUANTUM, rounding=ROUND_HALF_UP)
@@ -193,6 +220,12 @@ def register_initial_sample(conn: sqlite3.Connection, well: str, sample: str, vo
     capacity = get_well_capacity(conn, well)
     if capacity is not None and current + added > capacity:
         raise CapacityExceeded(well, current, added, capacity)
+    # 样本混合禁配：按补液混匀后的完整组成（现有样本 ∪ 本次样本）拦截。
+    projected_names = _well_composition_names(conn, well)
+    projected_names.add(sample)
+    violated = _find_pair_violation(active_forbidden_pairs(conn), projected_names)
+    if violated is not None:
+        raise MixingConflict(well, violated)
     _set_volume(conn, well, current + added)
     _set_composition(conn, well, sample_id, q(_composition_amount(conn, well, sample_id) + volume))
     _record_event(conn, well, "top_up", sample=sample, volume=dec_str(added))
@@ -443,6 +476,10 @@ def execute_batch(
 
     own_items, held_by_others = _reservation_context(conn, operations, reservation_id)
 
+    # 样本混合禁配规则在整个批次执行期间固定为「校验开始时」的当前版本：
+    # 规则写入与批次经同一把写锁串行，批次执行中不可能有规则变更。
+    forbidden = active_forbidden_pairs(conn)
+
     batch_id = insert_batch(
         conn,
         request_key,
@@ -457,6 +494,13 @@ def execute_batch(
         apply_transfer(
             conn, op.source, op.destination, volume, held_by_others[op.source]
         )
+        # 按目标孔本步之后的完整组成拦截禁配（来源孔只减少样本，不会新产生禁配对）。
+        violated = _find_pair_violation(
+            forbidden, _well_composition_names(conn, op.destination)
+        )
+        if violated is not None:
+            rule_id = _rule_id_map(conn).get(violated)
+            raise MixingConflict(op.destination, violated, step=step, rule_id=rule_id)
         conn.execute(
             "INSERT INTO operations (batch_id, step, source, destination, volume) "
             "VALUES (?, ?, ?, ?, ?)",
@@ -526,11 +570,13 @@ class ReversalConflict(Exception):
         message: str,
         blockers: list[dict] | None = None,
         exceeding: list[dict] | None = None,
+        mixing: list[dict] | None = None,
     ) -> None:
         self.reason = reason
         self.message = message
         self.blockers = blockers or []
         self.exceeding = exceeding or []
+        self.mixing = mixing or []
         super().__init__(message)
 
 
@@ -697,6 +743,40 @@ def apply_reversal(conn: sqlite3.Connection, batch_id: int, request_key: str) ->
             "reservations_active",
             f"批次 {batch_id} 撤销后部分孔位液体不足以覆盖生效预留，不可撤销",
             blockers=reservation_blockers,
+        )
+
+    # 恢复快照前同样核对样本混合禁配：撤销会把各孔恢复到批前的完整组成，
+    # 该组成不得违反「当前」生效规则（规则可能在批次提交后才启用）。
+    # 逐孔列出命中的全部禁配对，任一命中即整次拒绝撤销。
+    forbidden = active_forbidden_pairs(conn)
+    mixing_violations = []
+    for snap in snaps:
+        restored_names = {
+            r["name"]
+            for r in conn.execute(
+                "SELECT s.name AS name FROM batch_snapshot_composition c "
+                "JOIN samples s ON s.id = c.sample_id "
+                "WHERE c.batch_id = ? AND c.well = ?",
+                (batch_id, snap["well"]),
+            ).fetchall()
+        }
+        pair_violations = _all_pair_violations(forbidden, restored_names)
+        if pair_violations:
+            rule_ids = _rule_id_map(conn)
+            mixing_violations.append(
+                {
+                    "well": snap["well"],
+                    "pairs": [
+                        {"samples": [a, b], "rule_id": rule_ids.get((a, b))}
+                        for a, b in pair_violations
+                    ],
+                }
+            )
+    if mixing_violations:
+        raise ReversalConflict(
+            "mixing_conflict",
+            f"批次 {batch_id} 撤销恢复的快照将违反当前样本混合禁配规则，不可撤销",
+            mixing=mixing_violations,
         )
 
     _restore_snapshot(conn, batch_id)
@@ -1448,14 +1528,32 @@ class PlanStale(Exception):
     """确认（或计划落库前的二次核对）时快照涉及孔已偏离规范快照。
 
     changed_wells 逐孔列出变化维度与原因；计划保持可重试。
+    policy_changed 为 True 时表示涉及孔未变但样本混合禁配策略修订号已变化
+    （规则增删），载荷附创建时/当前修订号；此时 changed_wells 为空。
     """
 
-    def __init__(self, changed_wells: list[dict]) -> None:
+    def __init__(
+        self,
+        changed_wells: list[dict],
+        *,
+        policy_changed: bool = False,
+        revision_at_plan: int | None = None,
+        revision_now: int | None = None,
+    ) -> None:
         self.changed_wells = changed_wells
-        labels = "、".join(
-            f"{c['well']}（{'、'.join(c['reasons'])}）" for c in changed_wells
-        )
-        super().__init__(f"计划快照涉及孔状态已变化：{labels}")
+        self.policy_changed = policy_changed
+        self.revision_at_plan = revision_at_plan
+        self.revision_now = revision_now
+        if policy_changed:
+            super().__init__(
+                f"计划创建后样本混合禁配策略已变化：修订号 {revision_at_plan} → "
+                f"{revision_now}，确认被拒绝"
+            )
+        else:
+            labels = "、".join(
+                f"{c['well']}（{'、'.join(c['reasons'])}）" for c in changed_wells
+            )
+            super().__init__(f"计划快照涉及孔状态已变化：{labels}")
 
 
 class PlanCommitConflict(Exception):
@@ -1556,12 +1654,15 @@ def _simulate_transfers(
     operations: list,
     held_by_others: dict[str, Decimal],
     sample_names: dict[int, str],
+    forbidden: set[tuple[str, str]],
 ) -> list[dict]:
     """在内存快照上严格按提交流程逐步预演，返回逐步校验结果。
 
     与 apply_transfer 同一套规则：来源可吸取量 = 当前体积 − 无权动用预留；
-    目标孔容量按每一步的当时体积校验；按比例（最大余量法）带走各样本。
+    目标孔容量按每一步的当时体积校验；按比例（最大余量法）带走各样本；
+    目标孔每一步后的完整组成还须满足当前样本混合禁配规则。
     任一步失败抛 PlanSimulationError（已完成步骤随异常返回）。
+    forbidden 为当前生效禁配对（样本名字典序二元组集合）。
     """
     steps: list[dict] = []
     for step, op in enumerate(operations, start=1):
@@ -1639,6 +1740,35 @@ def _simulate_transfers(
                 steps,
             )
 
+        # 样本混合禁配：按目标孔本步之后的完整组成（样本名集合）拦截。
+        dst_names = {sample_names[sid] for sid, amount in dst["composition"].items() if amount > ZERO}
+        violated = _find_pair_violation(forbidden, dst_names)
+        if violated is not None:
+            pair = violated
+            steps.append(
+                {
+                    "step": step,
+                    "source": source,
+                    "destination": destination,
+                    "volume": dec_str(volume),
+                    "ok": False,
+                    "reason": "mixing_conflict",
+                    "well": destination,
+                    "pair": [pair[0], pair[1]],
+                }
+            )
+            raise PlanSimulationError(
+                "mixing_conflict",
+                f"孔位 {destination} 第 {step} 步后的完整组成包含禁配样本对 "
+                f"{pair[0]}、{pair[1]}，整批拒绝",
+                {
+                    "well": destination,
+                    "pair": [pair[0], pair[1]],
+                    "failed_step": step,
+                },
+                steps,
+            )
+
         src["volume"] = src_volume - moved_total
         dst["volume"] = dst_volume + moved_total
         steps.append(
@@ -1668,13 +1798,13 @@ def _simulate_transfers(
 
 def preview_plan(
     conn: sqlite3.Connection, operations: list, reservation_id: int | None
-) -> tuple[dict[str, dict], list[dict], dict[str, Decimal]]:
+) -> tuple[dict[str, dict], list[dict], dict[str, Decimal], int, set[tuple[str, str]]]:
     """只读核对：在调用方的只读快照事务内固定规范快照并逐步预演。
 
     先做与直接提交批次完全一致的隔离/预留前置校验（这些失败不落计划、
-    不消耗 request_key），随后在内存中预演全部移液。返回
-    （规范快照, 逐步校验结果, 本预留逐孔体积）；预演失败抛
-    PlanSimulationError（不落任何状态）。
+    不消耗 request_key），随后在内存中按当前样本混合禁配规则预演全部移液。
+    返回（规范快照, 逐步校验结果, 本预留逐孔体积, 当前策略修订号,
+    生效禁配对集合）；预演失败抛 PlanSimulationError（不落任何状态）。
     """
     touched_wells = list(dict.fromkeys(
         well
@@ -1692,10 +1822,12 @@ def preview_plan(
         for sid in state["composition"]
     )
     names = _sample_names(conn, sample_ids)
+    forbidden = active_forbidden_pairs(conn)
+    revision = mixing_policy_revision(conn)
     # 预演会就地推进各孔体积/组成；落库需要预演前的规范快照，深拷贝后再演。
     simulated = deepcopy(snapshot)
-    steps = _simulate_transfers(simulated, operations, held_by_others, names)
-    return snapshot, steps, own_items
+    steps = _simulate_transfers(simulated, operations, held_by_others, names, forbidden)
+    return snapshot, steps, own_items, revision, forbidden
 
 
 def create_plan(
@@ -1704,15 +1836,28 @@ def create_plan(
     operations: list,
     reservation_id: int | None,
     snapshot: dict[str, dict],
+    policy_revision: int,
 ) -> int:
     """写事务内落库计划；落库前重读涉及孔，若已偏离只读快照则抛 PlanStale。
 
-    计划本身不写批次、不改变液体；只在状态自洽时持久化操作与规范快照。
+    计划本身不写批次、不改变液体；只在状态自洽时持久化操作、规范快照与
+    创建时的混合禁配策略修订号。只读快照之后规则有任何增删（修订号变化）
+    同样整次不落计划、不消耗 request_key。
     """
     changed = snapshot_drift(conn, list(snapshot), snapshot)
     if changed:
         raise PlanStale(changed)
-    return insert_plan(conn, request_key, operations, reservation_id, snapshot)
+    current_revision = mixing_policy_revision(conn)
+    if current_revision != policy_revision:
+        raise PlanStale(
+            [], policy_changed=True, revision_at_plan=policy_revision,
+            revision_now=current_revision,
+        )
+    forbidden = active_forbidden_pairs(conn)
+    return insert_plan(
+        conn, request_key, operations, reservation_id, snapshot,
+        policy_revision, forbidden,
+    )
 
 
 def insert_plan(
@@ -1721,12 +1866,14 @@ def insert_plan(
     operations: list,
     reservation_id: int | None,
     snapshot: dict[str, dict],
+    policy_revision: int = 0,
+    forbidden: set[tuple[str, str]] | None = None,
 ) -> int:
     """在调用方写事务内落库计划：操作顺序 + 规范快照（不写批次、不动液体）。"""
     cur = conn.execute(
-        "INSERT INTO transfer_plans (request_key, reservation_id, status, created_at) "
-        "VALUES (?, ?, 'awaiting_confirmation', ?)",
-        (request_key, reservation_id, _now()),
+        "INSERT INTO transfer_plans (request_key, reservation_id, status, created_at, "
+        "mixing_policy_revision) VALUES (?, ?, 'awaiting_confirmation', ?, ?)",
+        (request_key, reservation_id, _now(), policy_revision),
     )
     plan_id = int(cur.lastrowid)
     conn.executemany(
@@ -1770,6 +1917,12 @@ def insert_plan(
                 (plan_id, well, reservation_id, dec_str(item["volume"]))
                 for reservation_id, item in sorted(state["reservations"].items())
             ],
+        )
+    if forbidden:
+        conn.executemany(
+            "INSERT INTO plan_snapshot_mixing_rules (plan_id, sample_a, sample_b) "
+            "VALUES (?, ?, ?)",
+            [(plan_id, a, b) for a, b in sorted(forbidden)],
         )
     return plan_id
 
@@ -1878,7 +2031,16 @@ def _stored_steps(conn: sqlite3.Connection, plan_id: int, plan_row: sqlite3.Row)
         conn,
         (sid for state in snapshot.values() for sid in state["composition"]),
     )
-    return _simulate_transfers(snapshot, ops, held_by_others, names)
+    # 重放逐步校验使用计划创建时生效的禁配规则版本（与快照一致），不随
+    # 当前规则变化；规则变化只在确认时以 plan_stale 拦截。
+    forbidden = {
+        (r["sample_a"], r["sample_b"])
+        for r in conn.execute(
+            "SELECT sample_a, sample_b FROM plan_snapshot_mixing_rules WHERE plan_id = ?",
+            (plan_id,),
+        ).fetchall()
+    }
+    return _simulate_transfers(snapshot, ops, held_by_others, names, forbidden)
 
 
 def plan_payload(
@@ -1915,6 +2077,12 @@ def plan_payload(
         "created_at": row["created_at"],
         "committed_at": row["committed_at"],
         "replayed": replayed,
+        # 创建计划时的混合禁配策略修订号；规则任何增删都会使确认 409 plan_stale。
+        "mixing_policy_revision": (
+            int(row["mixing_policy_revision"])
+            if "mixing_policy_revision" in row.keys()
+            else 0
+        ),
         "operations": operations,
         "snapshot": _plan_snapshot_payload(conn, row["id"]),
         "validation": {
@@ -2162,6 +2330,22 @@ def confirm_plan(conn: sqlite3.Connection, plan_id: int, confirm_key: str) -> in
     if changed:
         raise PlanStale(changed)
 
+    # 计划快照包含策略修订号：规则任何增删（即使不影响本次移液的孔与样本）
+    # 都使确认返回 409，计划保持待确认、confirm_key 未消耗，可原键重试。
+    revision_at_plan = (
+        int(plan["mixing_policy_revision"])
+        if "mixing_policy_revision" in plan.keys()
+        else 0
+    )
+    revision_now = mixing_policy_revision(conn)
+    if revision_at_plan != revision_now:
+        raise PlanStale(
+            [],
+            policy_changed=True,
+            revision_at_plan=revision_at_plan,
+            revision_now=revision_now,
+        )
+
     # confirm_key 同时作为批次 request_key：若与直接提交/其他确认产生的批次键
     # 冲突，明确 409（该确认不执行、不扣量、不消耗键），而非触发底层唯一约束。
     existing_batch = find_batch_by_key(conn, confirm_key)
@@ -2201,3 +2385,330 @@ def confirm_plan(conn: sqlite3.Connection, plan_id: int, confirm_key: str) -> in
         (now, plan_id),
     )
     return confirmation_id
+
+
+# ---------------------------------------------------------------- 样本混合禁配策略
+
+
+class MixingRuleConflict(Exception):
+    """禁配规则请求被现有状态拒绝（调用方回滚，策略不变、request_key 不消耗）。
+
+    kind 为 rule_active（add 的样本对已有生效规则）或
+    composition_conflict（add 时已有登记孔的完整组成命中该禁配对）。
+    """
+
+    def __init__(self, kind: str, message: str, detail: list[dict]) -> None:
+        self.kind = kind
+        self.detail = detail
+        super().__init__(message)
+
+
+def mixing_policy_revision(conn: sqlite3.Connection) -> int:
+    """当前样本混合禁配策略修订号（初始 0，每次成功 add/remove +1）。"""
+    row = conn.execute("SELECT revision FROM mixing_policy_state WHERE id = 1").fetchone()
+    return int(row["revision"])
+
+
+def active_mixing_rules(conn: sqlite3.Connection) -> list[dict]:
+    """全部生效禁配规则，按样本对字典序排列（含规则编号、原因与请求信息）。"""
+    rows = conn.execute(
+        "SELECT mr.id AS rule_id, mr.sample_a AS sample_a, mr.sample_b AS sample_b, "
+        "       mr.reason AS reason, mr.created_at AS created_at, "
+        "       mr.request_id AS request_id, mreq.request_key AS request_key "
+        "FROM mixing_rules mr JOIN mixing_rule_requests mreq ON mreq.id = mr.request_id "
+        "WHERE mr.status = 'active' ORDER BY mr.sample_a, mr.sample_b"
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def active_forbidden_pairs(conn: sqlite3.Connection) -> set[tuple[str, str]]:
+    """当前生效禁配对集合（样本名字典序二元组）。"""
+    return {(r["sample_a"], r["sample_b"]) for r in conn.execute(
+        "SELECT sample_a, sample_b FROM mixing_rules WHERE status = 'active'"
+    ).fetchall()}
+
+
+def _find_pair_violation(
+    forbidden: set[tuple[str, str]], names: set[str]
+) -> tuple[str, str] | None:
+    """给定孔的完整组成样本集合，返回首个命中的禁配对（字典序稳定）。"""
+    for a, b in sorted(forbidden):
+        if a in names and b in names:
+            return a, b
+    return None
+
+
+def _all_pair_violations(
+    forbidden: set[tuple[str, str]], names: set[str]
+) -> list[tuple[str, str]]:
+    """给定孔组成命中的全部禁配对（排序稳定），供撤销逐孔列出。"""
+    return [(a, b) for a, b in sorted(forbidden) if a in names and b in names]
+
+
+def _well_composition_names(conn: sqlite3.Connection, well: str) -> set[str]:
+    """孔内当前完整组成的样本名集合（amount 为 0 的行已在写入侧删除）。"""
+    return {
+        r["name"]
+        for r in conn.execute(
+            "SELECT s.name AS name FROM well_composition wc "
+            "JOIN samples s ON s.id = wc.sample_id WHERE wc.well = ?",
+            (well,),
+        ).fetchall()
+    }
+
+
+def _rule_id_map(conn: sqlite3.Connection) -> dict[tuple[str, str], int]:
+    return {
+        (r["sample_a"], r["sample_b"]): int(r["id"])
+        for r in conn.execute(
+            "SELECT id, sample_a, sample_b FROM mixing_rules WHERE status = 'active'"
+        ).fetchall()
+    }
+
+
+# 并发 add 兜底时路由层需重读生效规则编号：暴露同名公开接口。
+active_rule_id_map = _rule_id_map
+
+
+def find_mixing_request_by_key(
+    conn: sqlite3.Connection, request_key: str
+) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM mixing_rule_requests WHERE request_key = ?", (request_key,)
+    ).fetchone()
+
+
+def mixing_request_target(
+    conn: sqlite3.Connection, request_id: int
+) -> tuple[str, list[tuple[str, str]]]:
+    """禁配请求的目标：（action, 排序去重后的样本对列表），同键换目标判定依据。"""
+    row = conn.execute(
+        "SELECT action FROM mixing_rule_requests WHERE id = ?", (request_id,)
+    ).fetchone()
+    pairs = [
+        (r["sample_a"], r["sample_b"])
+        for r in conn.execute(
+            "SELECT sample_a, sample_b FROM mixing_rule_request_pairs "
+            "WHERE request_id = ? ORDER BY sample_a, sample_b",
+            (request_id,),
+        ).fetchall()
+    ]
+    return row["action"], pairs
+
+
+def _existing_composition_conflicts(
+    conn: sqlite3.Connection, pairs: list[tuple[str, str]]
+) -> list[dict]:
+    """add 前扫描：哪些已登记孔的当前完整组成同时包含某一禁配对的两个样本。
+
+    逐对查询（一次请求至多 64 对），返回按孔聚合的稳定结果，附命中对与
+    各样本在孔中的量。
+    """
+    by_well: dict[str, list[dict]] = {}
+    for a, b in pairs:
+        rows = conn.execute(
+            "SELECT ca.well AS well, ca.amount AS amount_a, cb.amount AS amount_b "
+            "FROM samples sa "
+            "JOIN samples sb ON sb.name = ? AND sa.name = ? "
+            "JOIN well_composition ca ON ca.sample_id = sa.id "
+            "JOIN well_composition cb ON cb.sample_id = sb.id AND cb.well = ca.well "
+            "ORDER BY ca.well",
+            (b, a),
+        ).fetchall()
+        for r in rows:
+            by_well.setdefault(r["well"], []).append(
+                {
+                    "samples": [a, b],
+                    "amounts": {a: r["amount_a"], b: r["amount_b"]},
+                }
+            )
+    return [
+        {"well": well, "conflicting_pairs": by_well[well]}
+        for well in sorted(by_well)
+    ]
+
+
+def _bump_policy_revision(conn: sqlite3.Connection) -> int:
+    """策略修订号 +1 并返回新值（与规则写入同一事务）。"""
+    conn.execute("UPDATE mixing_policy_state SET revision = revision + 1 WHERE id = 1")
+    return mixing_policy_revision(conn)
+
+
+def apply_mixing_rule_request(
+    conn: sqlite3.Connection,
+    request_key: str,
+    action: str,
+    reason: str,
+    pairs: list[tuple[str, str]],
+) -> tuple[int, list[int]]:
+    """在调用方写事务内原子提交一次 add/remove 禁配请求。
+
+    调用方须已在写事务（与补液/批次/撤销/计划确认等串行）。pairs 为已
+    排序去重的 (a, b) 样本名字典序二元组列表（由 schema 层 SamplePair
+    规范化）。
+
+    add：同一对已有生效规则 -> MixingRuleConflict(rule_active)；已有登记孔
+    的完整组成命中任一对 -> MixingRuleConflict(composition_conflict)；任一
+    冲突整次回滚、策略不变、不消耗 request_key。成功时每对插入一条 active
+    规则，修订号 +1。
+    remove：不要求规则当前生效（重复撤销不报错）；把存在的 active 行置为
+    removed；修订号 +1（即使没有行真正改变，remove 请求本身也是一次修订）。
+
+    返回（请求记录 id, 受影响规则 id 列表：add 为新规则 id，remove 为被
+    撤销的规则 id）。
+    """
+    pairs = sorted(set(pairs))
+    now = _now()
+    affected_rule_ids: list[int] = []
+    if action == "add":
+        active_map = _rule_id_map(conn)
+        already = [
+            {"samples": [a, b], "rule_id": active_map[(a, b)]}
+            for a, b in pairs
+            if (a, b) in active_map
+        ]
+        if already:
+            raise MixingRuleConflict(
+                "rule_active",
+                "部分样本对已存在生效禁配规则，同一对只能有一条生效规则",
+                already,
+            )
+        conflicts = _existing_composition_conflicts(conn, pairs)
+        if conflicts:
+            raise MixingRuleConflict(
+                "composition_conflict",
+                "部分已登记孔的当前组成已包含禁配样本对，启用规则将与其冲突",
+                conflicts,
+            )
+        cur = conn.execute(
+            "INSERT INTO mixing_rule_requests (request_key, action, reason, created_at) "
+            "VALUES (?, 'add', ?, ?)",
+            (request_key, reason, now),
+        )
+        request_id = int(cur.lastrowid)
+        conn.executemany(
+            "INSERT INTO mixing_rule_request_pairs (request_id, sample_a, sample_b) "
+            "VALUES (?, ?, ?)",
+            [(request_id, a, b) for a, b in pairs],
+        )
+        for a, b in pairs:
+            rule_cur = conn.execute(
+                "INSERT INTO mixing_rules (request_id, sample_a, sample_b, status, "
+                "reason, created_at) VALUES (?, ?, ?, 'active', ?, ?)",
+                (request_id, a, b, reason, now),
+            )
+            affected_rule_ids.append(int(rule_cur.lastrowid))
+        new_revision = _bump_policy_revision(conn)
+        conn.execute(
+            "UPDATE mixing_rule_requests SET revision_after = ? WHERE id = ?",
+            (new_revision, request_id),
+        )
+    else:
+        cur = conn.execute(
+            "INSERT INTO mixing_rule_requests (request_key, action, reason, created_at) "
+            "VALUES (?, 'remove', ?, ?)",
+            (request_key, reason, now),
+        )
+        request_id = int(cur.lastrowid)
+        conn.executemany(
+            "INSERT INTO mixing_rule_request_pairs (request_id, sample_a, sample_b) "
+            "VALUES (?, ?, ?)",
+            [(request_id, a, b) for a, b in pairs],
+        )
+        for a, b in pairs:
+            row = conn.execute(
+                "SELECT id FROM mixing_rules WHERE sample_a = ? AND sample_b = ? "
+                "AND status = 'active'",
+                (a, b),
+            ).fetchone()
+            if row is None:
+                continue
+            rule_id = int(row["id"])
+            conn.execute(
+                "UPDATE mixing_rules SET status = 'removed', removed_at = ?, "
+                "removed_by_request_id = ? WHERE id = ?",
+                (now, request_id, rule_id),
+            )
+            affected_rule_ids.append(rule_id)
+        new_revision = _bump_policy_revision(conn)
+        conn.execute(
+            "UPDATE mixing_rule_requests SET revision_after = ? WHERE id = ?",
+            (new_revision, request_id),
+        )
+    return request_id, affected_rule_ids
+
+
+def mixing_rule_payload(conn: sqlite3.Connection, request_id: int, replayed: bool = False) -> dict:
+    """单次 add/remove 禁配请求的响应：动作、样本对、原因、结果规则与修订号。"""
+    row = conn.execute(
+        "SELECT * FROM mixing_rule_requests WHERE id = ?", (request_id,)
+    ).fetchone()
+    pairs = [
+        [r["sample_a"], r["sample_b"]]
+        for r in conn.execute(
+            "SELECT sample_a, sample_b FROM mixing_rule_request_pairs "
+            "WHERE request_id = ? ORDER BY sample_a, sample_b",
+            (request_id,),
+        ).fetchall()
+    ]
+    rules = [
+        {
+            "rule_id": r["id"],
+            "samples": [r["sample_a"], r["sample_b"]],
+            "status": r["status"],
+            "reason": r["reason"],
+            "created_at": r["created_at"],
+            "removed_at": r["removed_at"],
+        }
+        for r in conn.execute(
+            "SELECT id, sample_a, sample_b, status, reason, created_at, removed_at "
+            "FROM mixing_rules WHERE request_id = ? ORDER BY sample_a, sample_b",
+            (request_id,),
+        ).fetchall()
+    ]
+    # remove 还会撤销其他请求建立的规则；把本次撤销的既有规则一并返回。
+    removed_existing = [
+        {
+            "rule_id": r["id"],
+            "samples": [r["sample_a"], r["sample_b"]],
+            "created_request_key": r["request_key"],
+        }
+        for r in conn.execute(
+            "SELECT mr.id AS id, mr.sample_a AS sample_a, mr.sample_b AS sample_b, "
+            "       mreq.request_key AS request_key "
+            "FROM mixing_rules mr JOIN mixing_rule_requests mreq ON mreq.id = mr.request_id "
+            "WHERE mr.removed_by_request_id = ? ORDER BY mr.sample_a, mr.sample_b",
+            (request_id,),
+        ).fetchall()
+    ]
+    return {
+        "mixing_request_id": row["id"],
+        "request_key": row["request_key"],
+        "action": row["action"],
+        "reason": row["reason"],
+        "created_at": row["created_at"],
+        "replayed": replayed,
+        "pairs": pairs,
+        "rules": rules,
+        "removed_rules": removed_existing,
+        "revision_after": int(row["revision_after"]),
+        "policy": mixing_policy_payload(conn),
+    }
+
+
+def mixing_policy_payload(conn: sqlite3.Connection) -> dict:
+    """当前禁配策略：修订号 + 全部生效规则。"""
+    return {
+        "revision": mixing_policy_revision(conn),
+        "rules": [
+            {
+                "rule_id": r["rule_id"],
+                "samples": [r["sample_a"], r["sample_b"]],
+                "reason": r["reason"],
+                "request_id": r["request_id"],
+                "request_key": r["request_key"],
+                "created_at": r["created_at"],
+            }
+            for r in active_mixing_rules(conn)
+        ],
+    }

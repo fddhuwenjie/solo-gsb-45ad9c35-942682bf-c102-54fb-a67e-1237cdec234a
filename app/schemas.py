@@ -273,3 +273,67 @@ class ReservationCancelCreate(BaseModel):
         if not value:
             raise ValueError("request_key 不能为空")
         return value
+
+
+# ---------------------------------------------------------------- 样本混合禁配策略
+
+
+class SamplePair(BaseModel):
+    """一个无序样本对：两个不同样本，顺序无关。
+
+    入库时统一按样本名字典序排列为 (sample_a, sample_b)；请求内重复对
+    （含反向写法）去重，一次请求至少剩一对、至多 64 对。
+    """
+
+    samples: list[str] = Field(min_length=2, max_length=2)
+
+    @field_validator("samples")
+    @classmethod
+    def _samples(cls, value: list[str]) -> list[str]:
+        cleaned = [s.strip() for s in value]
+        if not all(cleaned):
+            raise ValueError("样本名不能为空")
+        if not all(1 <= len(s) <= 128 for s in cleaned):
+            raise ValueError("样本名长度须在 1～128 字符之间")
+        return cleaned
+
+    @model_validator(mode="after")
+    def _distinct_samples(self) -> "SamplePair":
+        if self.samples[0] == self.samples[1]:
+            raise ValueError("禁配样本对必须是两个不同的样本")
+        return self
+
+    def normalized(self) -> tuple[str, str]:
+        a, b = self.samples
+        return (a, b) if a <= b else (b, a)
+
+
+class MixingRuleCreate(BaseModel):
+    """样本混合禁配规则请求：add 启用 / remove 撤销，1～64 个无序样本对。
+
+    同一对样本同一时刻只能有一条生效规则；启用规则时先扫描所有已登记孔，
+    若已有孔的完整组成同时包含某一对样本（组成冲突）则整次 409 且策略不变。
+    request_key 幂等：同键同动作同样本对集合重放返回首次结果，换目标 409。
+    """
+
+    request_key: str = Field(min_length=1, max_length=128)
+    action: str = Field(pattern="^(add|remove)$")
+    reason: str = Field(min_length=1, max_length=500)
+    pairs: list[SamplePair] = Field(min_length=1, max_length=64)
+
+    @field_validator("request_key", "reason")
+    @classmethod
+    def _text(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("字段不能为空")
+        return value
+
+    @model_validator(mode="after")
+    def _dedupe_pairs(self) -> "MixingRuleCreate":
+        # 无序对：(S1,S2) 与 (S2,S1) 视为同一对；排序去重得到目标的统一形式。
+        normalized = sorted({pair.normalized() for pair in self.pairs})
+        if len(normalized) > 64:
+            raise ValueError("一次最多提交 64 个不同的样本对")
+        self.pairs = [SamplePair(samples=list(pair)) for pair in normalized]
+        return self

@@ -14,6 +14,7 @@ from .schemas import (
     BatchCreate,
     CapacityUpdate,
     LineageQuarantineCreate,
+    MixingRuleCreate,
     PlanConfirmCreate,
     PlanCreate,
     QuarantineCreate,
@@ -77,6 +78,22 @@ def _well_quarantined_detail(exc: ledger.WellQuarantined, **extra) -> dict:
     }
 
 
+def _mixing_conflict_detail(exc: ledger.MixingConflict, **extra) -> dict:
+    """样本混合禁配冲突 409：孔位、命中的样本对与步骤（补液无步骤）。"""
+    detail = {
+        "message": str(exc),
+        "reason": "mixing_conflict",
+        "well": exc.well,
+        "pair": exc.pair,
+        **extra,
+    }
+    if exc.step is not None:
+        detail["failed_step"] = exc.step
+    if exc.rule_id is not None:
+        detail["rule_id"] = exc.rule_id
+    return detail
+
+
 @app.post("/wells", status_code=201)
 def register_well(payload: WellCreate, conn: sqlite3.Connection = Depends(get_db)) -> dict:
     """登记孔位中的初始样本与体积；同一孔位重复登记视为补液混匀。
@@ -85,12 +102,14 @@ def register_well(payload: WellCreate, conn: sqlite3.Connection = Depends(get_db
     """
     try:
         with db_module.write_transaction(conn):
-            # 立即取写锁：读改写与并发撤销/批次/容量变更串行，补液不会被旧快照覆盖
+            # 立即取写锁：读改写与并发撤销/批次/容量变更/禁配规则写入串行，补液不会被旧快照覆盖
             ledger.register_initial_sample(conn, payload.well, payload.sample, payload.volume)
     except ledger.WellQuarantined as exc:
         raise HTTPException(status_code=409, detail=_well_quarantined_detail(exc))
     except ledger.CapacityExceeded as exc:
         raise HTTPException(status_code=409, detail=_capacity_exceeded_detail(exc))
+    except ledger.MixingConflict as exc:
+        raise HTTPException(status_code=409, detail=_mixing_conflict_detail(exc))
     return ledger.well_state(conn, payload.well)
 
 
@@ -262,6 +281,25 @@ def submit_batch(
             status_code=409,
             detail=_capacity_exceeded_detail(exc, batch_id=batch_id),
         )
+    except ledger.MixingConflict as exc:
+        # 与容量超限同理：整批回滚，失败批次落库并消耗 request_key
+        try:
+            with db_module.write_transaction(conn):
+                batch_id = ledger.insert_batch(
+                    conn,
+                    payload.request_key,
+                    "failed",
+                    error=str(exc),
+                    reservation_id=payload.reservation_id,
+                )
+        except sqlite3.IntegrityError:
+            row = ledger.find_batch_by_key(conn, payload.request_key)
+            response.status_code = 200
+            return ledger.batch_payload(conn, row["id"], replayed=True)
+        raise HTTPException(
+            status_code=409,
+            detail=_mixing_conflict_detail(exc, batch_id=batch_id),
+        )
     except sqlite3.IntegrityError:
         # 并发下同一 request_key 已被写入：按重放处理，不重复执行
         row = ledger.find_batch_by_key(conn, payload.request_key)
@@ -335,13 +373,18 @@ def _plan_replay_or_conflict(
 
 
 def _plan_stale_detail(exc: ledger.PlanStale, **extra) -> dict:
-    """快照失效 409：逐孔列出变化维度与原因，计划保持可重试。"""
-    return {
+    """快照失效 409：逐孔列出变化维度与原因；规则变化附前后修订号。"""
+    detail = {
         "message": str(exc),
         "reason": "plan_stale",
         "changed_wells": exc.changed_wells,
         **extra,
     }
+    if exc.policy_changed:
+        detail["policy_changed"] = True
+        detail["mixing_policy_revision_at_plan"] = exc.revision_at_plan
+        detail["mixing_policy_revision_now"] = exc.revision_now
+    return detail
 
 
 @app.post("/plans", status_code=201)
@@ -369,10 +412,11 @@ def create_plan(
             row = ledger.find_plan_by_key(conn, payload.request_key)
             if row is not None:
                 return _plan_replay_or_conflict(conn, row, payload, response)
-            snapshot, steps, _own = ledger.preview_plan(
+            snapshot, steps, _own, policy_revision, _forbidden = ledger.preview_plan(
                 conn, payload.operations, payload.reservation_id
             )
-        # 写事务落库：重读涉及孔，只读快照之后若已有任何变更即 409（不落计划）。
+        # 写事务落库：重读涉及孔，只读快照之后若已有任何变更（含禁配策略
+        # 修订号变化）即 409（不落计划）。
         with db_module.write_transaction(conn):
             row = ledger.find_plan_by_key(conn, payload.request_key)
             if row is not None:
@@ -383,6 +427,7 @@ def create_plan(
                 payload.operations,
                 payload.reservation_id,
                 snapshot,
+                policy_revision,
             )
     except ledger.WellQuarantined as exc:
         # 隔离冲突：不落计划、不消耗 request_key，解除隔离后同键可重试
@@ -587,6 +632,13 @@ def confirm_plan(
             status_code=409,
             detail=_capacity_exceeded_detail(exc, plan_id=plan_id),
         )
+    except ledger.MixingConflict as exc:
+        # 锁内执行时命中禁配（通常已被 plan_stale 拦截；防御性兜底）：
+        # 不执行、不扣量、不消耗 confirm_key
+        raise HTTPException(
+            status_code=409,
+            detail=_mixing_conflict_detail(exc, plan_id=plan_id),
+        )
     except sqlite3.IntegrityError:
         # 兜底：极端并发下 confirm_key 唯一约束拦截
         row = ledger.find_confirmation_by_key(conn, payload.confirm_key)
@@ -684,6 +736,8 @@ def reverse_batch(
             detail["blocking_wells"] = exc.blockers
         if exc.exceeding:
             detail["exceeding_wells"] = exc.exceeding
+        if exc.mixing:
+            detail["violating_wells"] = exc.mixing
         raise HTTPException(status_code=409, detail=detail)
     except sqlite3.IntegrityError:
         # 兜底：极端并发下 request_key 唯一约束拦截（正常已被锁内复核覆盖）
@@ -1246,3 +1300,133 @@ def cancel_reservation(
 
     response.status_code = 201
     return ledger.cancellation_payload(conn, cancellation_id)
+
+
+# ---------------------------------------------------------------- 样本混合禁配策略
+
+
+def _mixing_replay_or_conflict(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+    payload: MixingRuleCreate,
+    response: Response,
+) -> dict:
+    """同键同目标（动作 + 排序去重样本对集合）重放；同键换目标 409。
+
+    原因不参与目标身份：同键同动作同样本对、不同原因仍按重放返回首次结果。
+    """
+    existing_action, existing_pairs = ledger.mixing_request_target(conn, int(row["id"]))
+    submitted_pairs = [pair.normalized() for pair in payload.pairs]
+    if existing_action == payload.action and existing_pairs == submitted_pairs:
+        response.status_code = 200
+        return ledger.mixing_rule_payload(conn, int(row["id"]), replayed=True)
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "message": (
+                f"request_key {payload.request_key} 已用于另一次禁配规则请求"
+                f"（{existing_action} {['/'.join(p) for p in existing_pairs]}），"
+                f"不能再提交不同目标（{payload.action} "
+                f"{['/'.join(p) for p in submitted_pairs]}）"
+            ),
+            "reason": "request_key_conflict",
+            "existing_mixing_request_id": int(row["id"]),
+            "existing_action": existing_action,
+            "existing_pairs": [
+                {"samples": [a, b]} for a, b in existing_pairs
+            ],
+        },
+    )
+
+
+@app.post("/mixing-rules", status_code=201)
+def submit_mixing_rule(
+    payload: MixingRuleCreate,
+    response: Response,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> dict:
+    """提交样本混合禁配规则请求：add 启用 / remove 撤销，1～64 个无序样本对。
+
+    同一对样本同一时刻只能有一条生效规则；启用规则时先在同一写事务扫描
+    所有已登记孔，任一孔当前完整组成已包含该对样本（组成冲突）即整次 409
+    且策略不变、request_key 不消耗。成功 add/remove 都使策略修订号 +1，
+    与补液、批次、撤销、计划确认等写操作经同一把锁串行。
+    request_key 幂等：同键同动作同样本对重放返回首次结果（200），换目标
+    （换动作或换样本对）返回 409 request_key_conflict。
+    """
+    # 事务外快速路径：无并发时直接给出重放/换目标结论，免取写锁。
+    existing = ledger.find_mixing_request_by_key(conn, payload.request_key)
+    if existing is not None:
+        return _mixing_replay_or_conflict(conn, existing, payload, response)
+
+    pairs = [pair.normalized() for pair in payload.pairs]
+    try:
+        # BEGIN IMMEDIATE 立即取锁：键复核、既有规则/既有组成扫描与全部写入
+        # 持同一把锁完成，与并发补液/批次/撤销/计划确认串行，规则生效后
+        # 的下一次移液必然看到新规则，反之亦然。
+        with db_module.write_transaction(conn):
+            row = ledger.find_mixing_request_by_key(conn, payload.request_key)
+            if row is not None:
+                return _mixing_replay_or_conflict(conn, row, payload, response)
+            mixing_request_id, _rule_ids = ledger.apply_mixing_rule_request(
+                conn, payload.request_key, payload.action, payload.reason, pairs
+            )
+    except ledger.MixingRuleConflict as exc:
+        # 既有生效规则或既有组成冲突：策略不变、不写请求、不消耗 request_key
+        reason_code = (
+            "mixing_rule_active" if exc.kind == "rule_active"
+            else "mixing_composition_conflict"
+        )
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": str(exc),
+                "reason": reason_code,
+                "action": payload.action,
+                (
+                    "active_pairs" if exc.kind == "rule_active"
+                    else "conflicting_wells"
+                ): exc.detail,
+            },
+        )
+    except sqlite3.IntegrityError:
+        # 兜底：极端并发下 request_key 唯一约束或 active 部分唯一索引拦截
+        row = ledger.find_mixing_request_by_key(conn, payload.request_key)
+        if row is not None:
+            return _mixing_replay_or_conflict(conn, row, payload, response)
+        # 同对 active 规则的并发 add（不同 request_key）命中部分唯一索引：
+        # 重读生效规则，把本次请求中仍被占用的对逐对返回。
+        if payload.action == "add":
+            active_ids = ledger.active_rule_id_map(conn)
+            active_pairs = [
+                {"samples": [a, b], "rule_id": active_ids[(a, b)]}
+                for a, b in pairs
+                if (a, b) in active_ids
+            ]
+            if active_pairs:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "message": "部分样本对已存在并发提交的生效禁配规则",
+                        "reason": "mixing_rule_active",
+                        "action": payload.action,
+                        "active_pairs": active_pairs,
+                    },
+                )
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "禁配规则请求与现有记录冲突",
+                "reason": "request_key_conflict",
+                "action": payload.action,
+            },
+        )
+
+    response.status_code = 201
+    return ledger.mixing_rule_payload(conn, mixing_request_id)
+
+
+@app.get("/mixing-rules")
+def get_mixing_policy(conn: sqlite3.Connection = Depends(get_db)) -> dict:
+    """当前样本混合禁配策略：修订号 + 全部生效规则。"""
+    return ledger.mixing_policy_payload(conn)

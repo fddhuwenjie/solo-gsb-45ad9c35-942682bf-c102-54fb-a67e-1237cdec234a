@@ -209,7 +209,9 @@ CREATE TABLE IF NOT EXISTS transfer_plans (
     -- awaiting_confirmation（已核对待确认）/ committed（已确认并原子执行）
     status         TEXT NOT NULL CHECK (status IN ('awaiting_confirmation', 'committed')),
     created_at     TEXT NOT NULL,
-    committed_at   TEXT
+    committed_at   TEXT,
+    -- 创建计划时的样本混合禁配策略修订号；确认时与当前修订号不一致即 plan_stale。
+    mixing_policy_revision INTEGER NOT NULL DEFAULT 0
 );
 
 -- 计划的逐步操作，按 step 保存原始提交顺序（确认时严格按此顺序重放）。
@@ -254,6 +256,15 @@ CREATE TABLE IF NOT EXISTS plan_snapshot_reservations (
     PRIMARY KEY (plan_id, well, reservation_id)
 );
 
+-- 计划创建时生效的样本混合禁配规则（确认时重放逐步校验用的规则版本）。
+-- 确认执行仍以「当前」规则为准；规则任何增删都会抬高修订号并使确认 409。
+CREATE TABLE IF NOT EXISTS plan_snapshot_mixing_rules (
+    plan_id   INTEGER NOT NULL REFERENCES transfer_plans(id),
+    sample_a  TEXT NOT NULL,
+    sample_b  TEXT NOT NULL,
+    PRIMARY KEY (plan_id, sample_a, sample_b)
+);
+
 -- 计划确认：独立 confirm_key 幂等（重放不重复扣量）；同键换计划 409。
 CREATE TABLE IF NOT EXISTS plan_confirmations (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -262,6 +273,56 @@ CREATE TABLE IF NOT EXISTS plan_confirmations (
     batch_id    INTEGER REFERENCES batches(id),
     confirmed_at TEXT NOT NULL
 );
+
+-- ---------------------------------------------------------------- 样本混合禁配策略
+-- 调用方用 request_key 提交 add/remove 动作与 1～64 个无序样本对及原因。
+-- 每对样本同一时刻至多有一条生效规则（active 行上的部分唯一索引保证）；
+-- remove 仅把规则置为 removed 并保留审计。策略修订号在单行状态表中维护，
+-- 每次成功的 add/remove 在同一事务 +1；补液、批次每一步、计划确认与撤销
+-- 都按当前生效规则拦截禁配，计划快照保存创建时的修订号，规则变化使确认 409。
+CREATE TABLE IF NOT EXISTS mixing_rule_requests (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_key    TEXT NOT NULL UNIQUE,
+    action         TEXT NOT NULL CHECK (action IN ('add', 'remove')),
+    reason         TEXT NOT NULL,
+    -- 该请求提交后策略的修订号（重放时据此返回首次结果）
+    revision_after INTEGER NOT NULL DEFAULT 0,
+    created_at     TEXT NOT NULL
+);
+
+-- 请求携带的无序样本对：入库时统一为 sample_a < sample_b，逐请求去重。
+CREATE TABLE IF NOT EXISTS mixing_rule_request_pairs (
+    request_id INTEGER NOT NULL REFERENCES mixing_rule_requests(id),
+    sample_a   TEXT NOT NULL,
+    sample_b   TEXT NOT NULL,
+    PRIMARY KEY (request_id, sample_a, sample_b)
+);
+
+-- 禁配规则本身：add 成功插入 active 行；remove 把对应 active 行置为 removed。
+-- removed_by_request_id 记录是哪次 remove 使其失效；行永久保留为审计。
+CREATE TABLE IF NOT EXISTS mixing_rules (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id  INTEGER NOT NULL REFERENCES mixing_rule_requests(id),
+    sample_a    TEXT NOT NULL,
+    sample_b    TEXT NOT NULL,
+    status      TEXT NOT NULL CHECK (status IN ('active', 'removed')),
+    reason      TEXT NOT NULL,
+    created_at  TEXT NOT NULL,
+    removed_at  TEXT,
+    removed_by_request_id INTEGER REFERENCES mixing_rule_requests(id)
+);
+
+-- 同一对样本同一时刻至多一条生效规则。
+CREATE UNIQUE INDEX IF NOT EXISTS idx_mixing_rules_active_pair
+    ON mixing_rules(sample_a, sample_b) WHERE status = 'active';
+
+-- 策略全局状态：固定单行（id=1），revision 从 0 开始随成功 add/remove 递增。
+CREATE TABLE IF NOT EXISTS mixing_policy_state (
+    id       INTEGER PRIMARY KEY CHECK (id = 1),
+    revision INTEGER NOT NULL
+);
+
+INSERT OR IGNORE INTO mixing_policy_state (id, revision) VALUES (1, 0);
 """
 
 
@@ -295,7 +356,9 @@ def _migrate(conn: sqlite3.Connection) -> None:
 
     - wells 表补 max_capacity 列：既有行 NULL（不限容量）；
     - batches 表补 reservation_id 列：既有批次均为未绑定预留的普通批次（NULL）；
-    - batches 表补 plan_confirmation_id 列：既有批次均为直接提交（NULL）。
+    - batches 表补 plan_confirmation_id 列：既有批次均为直接提交（NULL）；
+    - transfer_plans 表补 mixing_policy_revision 列：既有计划均在策略上线前
+      创建，修订号一律为 0（当前库初始修订号也是 0），快照一致性语义保留。
     现有数据与行为完全保留。
     """
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(wells)")}
@@ -306,6 +369,13 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE batches ADD COLUMN reservation_id INTEGER")
     if "plan_confirmation_id" not in batch_columns:
         conn.execute("ALTER TABLE batches ADD COLUMN plan_confirmation_id INTEGER")
+    plan_columns = {
+        row["name"] for row in conn.execute("PRAGMA table_info(transfer_plans)")
+    }
+    if plan_columns and "mixing_policy_revision" not in plan_columns:
+        conn.execute(
+            "ALTER TABLE transfer_plans ADD COLUMN mixing_policy_revision INTEGER NOT NULL DEFAULT 0"
+        )
 
 
 @contextmanager
@@ -313,11 +383,11 @@ def write_transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
     """立即写事务：BEGIN IMMEDIATE 在事务起点就取得保留锁。
 
     所有变更端点（补液、批次、撤销、容量变更、隔离申请与解除、预留建立/
-    兑现/取消、计划建立/确认）都经此进入事务，使「校验读 → 写入 →
-    提交」全程互斥串行：后到的事务在 BEGIN IMMEDIATE 处等待，待先到者
-    提交后才开始读库，必然读到已提交的新状态，不会以旧快照覆盖新写入
-    （例如撤销完成阻塞检查后另一请求的补液）。等不到锁由 busy_timeout
-    决定，仍超时则抛 sqlite3.OperationalError 由调用方处理。
+    兑现/取消、计划建立/确认、禁配规则 add/remove）都经此进入事务，使
+    「校验读 → 写入 → 提交」全程互斥串行：后到的事务在 BEGIN IMMEDIATE
+    处等待，待先到者提交后才开始读库，必然读到已提交的新状态，不会以旧
+    快照覆盖新写入（例如撤销完成阻塞检查后另一请求的补液）。等不到锁由
+    busy_timeout 决定，仍超时则抛 sqlite3.OperationalError 由调用方处理。
     """
     conn.execute("BEGIN IMMEDIATE")
     try:
